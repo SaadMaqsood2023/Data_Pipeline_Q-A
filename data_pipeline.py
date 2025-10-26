@@ -38,6 +38,11 @@ uploaded = files.upload()  # Upload your bank_policies.pdf
 pdf_path = list(uploaded.keys())[0]
 print(f"Uploaded: {pdf_path}")
 
+CHUNK_SIZE = 500       # ~1200 words
+OVERLAP = 100
+QUESTIONS_PER_CHUNK = 7 # generate 7 Q&A per chunk
+MAX_NEW_TOKENS = 300
+
 def is_file_pdf(file_name):
   return os.path.splitext(file_name)[1].lower() == '.pdf'
 
@@ -87,10 +92,11 @@ def chunk_text(text, chunk_size=200, overlap=50):
     return chunks
 
 cleaned_text = clean_text(raw_text)
-chunks = chunk_text(cleaned_text, chunk_size=200, overlap=50)
+chunks = chunk_text(cleaned_text, chunk_size=CHUNK_SIZE, overlap=OVERLAP)
 
-print(f"Created {len(chunks)} chunks (200 words each, 50 overlap)")
+print(f"Created {len(chunks)} chunks (1000 words each, 150 overlap)")
 print(f"Example chunk:\n{chunks[10][:500]}...")
+print(f"Datatype of chunks is: {type(chunks)}")
 
 # =============================================
 # STEP 4: LOAD Phi-2 FOR Q/A GENERATION
@@ -108,8 +114,9 @@ qa_pipeline = pipeline(
     "text-generation",
     model=phi_model,
     tokenizer=phi_tokenizer,
-    max_new_tokens=80,
+    max_new_tokens=MAX_NEW_TOKENS,
     temperature=0.3,
+    top_p=0.92,
     do_sample=True,
     pad_token_id=phi_tokenizer.eos_token_id
 )
@@ -119,21 +126,46 @@ print("Phi-2 loaded for Q/A generation")
 # =============================================
 # STEP 5: GENERATE 4 Q/A PER CHUNK
 # =============================================
-def generate_qa_from_chunk(chunk):
-    prompt = f"""Given the following bank policy text, generate 4 short, factual question-answer pairs.
-Each answer must be under 25 words and cite the policy if possible.
-
-Text: {chunk}
-
-Format:
-Q1: [question]?
-A1: [answer]
-Q2: ...
+def build_prompt(chunk):
+    example_qa = """
+Example:
+Passage: A dormant account has no transactions for 12 months.
+Q: What is a dormant account?
+A: An account is classified as dormant if there are no customer-initiated transactions (such as deposits, withdrawals, or transfers) for a continuous period of twelve months. Bank-initiated actions like interest credits or fee deductions do not count toward activity.
 """
 
-    try:
-        full_output = qa_pipeline(prompt, max_new_tokens=200)[0]['generated_text']
+    return f"""You are a banking expert creating high-quality training data.
 
+{example_qa}
+
+Now, from this passage, generate exactly 7 detailed Q&A pairs:
+
+Passage:
+{chunk.strip()}
+
+INSTRUCTIONS:
+- Generate exactly 7 question-answer pairs.
+- Each question must be specific, clear, and test a unique policy detail, rule, or definition.
+- Each answer must be a complete, detailed sentence (or 2–3 sentences if needed) directly based on the passage.
+- Answers should be informative and precise, not just short phrases.
+- Use real terms, numbers, time periods, and conditions from the passage.
+- Avoid giving answers just in 1 or 2 words
+
+Format exactly:
+Q1: [question]?
+A1: [detailed answer]
+
+Q2: [question]?
+A2: [detailed answer]
+
+... up to Q7: and A7:
+Generate 7 pairs only. No explanations, no extra text.
+"""
+
+def generate_qa_from_chunk(chunk):
+    prompt = build_prompt(chunk)
+    try:
+        full_output = qa_pipeline(prompt, max_new_tokens=MAX_NEW_TOKENS)[0]['generated_text']
         # Extract only the part AFTER the original chunk
         if "Text:" in full_output:
             generated = full_output.split("Text:", 1)[1]
@@ -146,15 +178,11 @@ Q2: ...
         return ""
 
 
-
-
 qa_pairs = []
 print("Generating Q/A pairs from chunks...")
 
 for i, chunk in enumerate(tqdm(chunks[:5])):  # LIMIT TO 100 CHUNKS FOR NOW
     raw = generate_qa_from_chunk(chunk)
-    print("chunk id is ", i, "And chunk is ", chunk)
-    print("raw is", raw)
     qa_pairs.append({"chunk_id": i, "raw_qa": raw})
 
 print(f"Generated {len(qa_pairs)} raw Q/A blocks")
@@ -171,18 +199,31 @@ def parse_qa_block(block):
     questions = []
     answers = []
     i = 0
-    while i < len(lines):
-        if lines[i].startswith("Q") and lines[i].endswith("?"):
-            q = lines[i][3:].strip()  # Remove "Q1: "
-            if i+1 < len(lines) and lines[i+1].startswith("A"):
-                a = lines[i+1][3:].strip()
-                questions.append(q)
-                answers.append(a)
-                i += 2
+    while i < len(lines) - 1:
+        q_line = lines[i]
+        a_line = lines[i + 1]
+
+        # Match Q1:, Q2:, ..., Q7:
+        if re.match(r'^Q\d+:', q_line) and q_line.endswith('?'):
+            # Match A1:, A2:, etc.
+            if re.match(r'^A\d+:', a_line):
+                q_num = re.search(r'Q(\d+):', q_line).group(1)
+                a_num = re.search(r'A(\d+):', a_line).group(1)
+
+                # Ensure Q and A numbers match
+                if q_num == a_num:
+                    question = q_line.split(':', 1)[1].strip()  # After "Q1:"
+                    answer = a_line.split(':', 1)[1].strip()    # After "A1:"
+                    questions.append(question)
+                    answers.append(answer)
+                    i += 2
+                else:
+                    i += 1  # Skip mismatched
             else:
                 i += 1
         else:
             i += 1
+
     return list(zip(questions, answers))
 
 all_qa = []
@@ -198,28 +239,6 @@ real_df.head()
 # =============================================
 # STEP 7: GENERATE FAKE ANSWERS (Using Llama-70B 4-bit)
 # =============================================
-# !pip install bitsandbytes accelerate
-
-# from transformers import AutoModelForCausalLM as LlamaModel, AutoTokenizer
-
-# llama_model_name = "meta-llama/Meta-Llama-3.1-70B-Instruct"
-# llama_tokenizer = AutoTokenizer.from_pretrained(llama_model_name)
-
-# llama_model = LlamaModel.from_pretrained(
-#     llama_model_name,
-#     device_map="auto",
-#     load_in_4bit=True,
-#     torch_dtype=torch.float16
-# )
-
-# fake_generator = pipeline(
-#     "text-generation",
-#     model=llama_model,
-#     tokenizer=llama_tokenizer,
-#     max_new_tokens=60,
-#     temperature=0.9,
-#     do_sample=True
-# )
 
 fake_generator = qa_pipeline
 
@@ -227,8 +246,20 @@ print("Generating fake answers...")
 
 fake_qa = []
 for _, row in tqdm(real_df.iterrows(), total=len(real_df)):
-    prompt = f"Answer this bank policy question incorrectly or with made-up info:\nQ: {row['question']}\nA:"
+    fake_prompt = f"""You are a banking assistant who confidently gives incorrect policy information.
+    Answer the question below with a detailed, professional, and believable response — but the facts must be wrong or invented.
+
+    Important:
+    - Sound authoritative and use banking terms.
+    - Include plausible numbers, time periods, or rules.
+    - Do NOT say "I don't know", leave it blank, or repeat the question.
+    - Do NOT use placeholders like [], {{ }}, or "answer here".
+    - The answer must look 100% real to a customer.
+
+    Q: {row['question']}
+    A:"""
     try:
+        prompt = fake_prompt
         fake = fake_generator(prompt)[0]['generated_text'].split("A:")[-1].strip()
         fake_qa.append({
             "question": row["question"],
