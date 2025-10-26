@@ -187,10 +187,6 @@ for i, chunk in enumerate(tqdm(chunks[:5])):  # LIMIT TO 100 CHUNKS FOR NOW
 
 print(f"Generated {len(qa_pairs)} raw Q/A blocks")
 
-print(type(chunks))
-# print(chunks)
-print(qa_pairs[0])
-
 # =============================================
 # STEP 6: PARSE Q/A INTO CLEAN LIST
 # =============================================
