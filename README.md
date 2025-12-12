@@ -1,4 +1,4 @@
-# data-pipeline
+# Data-pipeline
 ```
 A modular, production-ready Question & Answer (Q/A) generation pipeline designed for bank policy documents.  
 The project transforms large policy PDFs into validated Q/A pairs using LLMs (Qwen 7B), evidence extraction, and semantic deduplication.
